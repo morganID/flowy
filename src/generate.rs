@@ -33,6 +33,7 @@ use std::{
 };
 
 use crate::{
+    net::{self, Reply},
     page,
     ui::{self, eval_patched},
 };
@@ -42,6 +43,19 @@ const POLL: Duration = Duration::from_millis(250);
 /// How long the set of new images has to stop growing before the batch counts as complete.
 /// Flow renders the frames of one request a moment apart, so this is a debounce, not a wait.
 const SETTLE: Duration = Duration::from_secs(2);
+
+/// How long the generation RPC gets to answer before the DOM takes over. A request takes ~20s
+/// end to end; a reply that has not arrived by now is not coming, and waiting out the full
+/// timeout would be worse than reading the cards.
+const RPC_WAIT: Duration = Duration::from_secs(60);
+
+/// If the recorder has not even seen the request by now, it is not watching this page — the
+/// app probably booted before it was installed. Fall back early rather than wait out [`RPC_WAIT`].
+const RPC_PROBE: Duration = Duration::from_secs(4);
+
+/// How long a fired trigger gets to show that it did something. A live submit clears the prompt
+/// box and sends the request; a stale binding does neither.
+const TRIGGER_WAIT: Duration = Duration::from_secs(6);
 
 /// Hook `addEventListener` and keep the listener bound to the generate button's output.
 /// Idempotent: the second call only reports what the first one captured.
@@ -124,10 +138,18 @@ struct State {
     failure: Option<String>,
 }
 
+/// Where the images were read from. A run says which path answered, so the fallback is visible
+/// rather than assumed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Rpc,
+    Dom,
+}
+
 /// How a request ended. Flow answers in one of three ways: images, a failure notice on the
 /// cards, or nothing at all.
 enum Outcome {
-    Images(Vec<String>),
+    Images(Vec<String>, Source),
     Failed(String),
     Timeout,
 }
@@ -140,11 +162,16 @@ struct Button {
 
 /// Generate images for `prompt` in the project the tab is on, and print the image URLs.
 ///
+/// The trigger is the UI's own path — it needs a trusted event and a scored reCAPTCHA token, and
+/// neither can be synthesised. The *results* are read from the generation RPC's reply when the
+/// recorder is in place, because that stream closes exactly when the request ends; the DOM is the
+/// fallback for when it is not.
+///
 /// Flow's image service fails a request often enough to matter — "Sorry, this image failed to
 /// generate", or the policy notice — without anything being wrong with the request. Both are
 /// retryable through the card's own Retry button, so a run retries instead of reporting a
 /// failure the first time it sees one.
-pub fn generate(prompt: &str, timeout: Duration, retries: usize) -> Result<()> {
+pub fn generate(prompt: &str, timeout: Duration, retries: usize, rpc_read: bool) -> Result<()> {
     if prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
@@ -152,6 +179,16 @@ pub fn generate(prompt: &str, timeout: Duration, retries: usize) -> Result<()> {
     page::ensure_bridge()?;
     let engine = page::engine();
     page::ensure_tab(engine)?;
+
+    // Installing the recorder means navigating, so it is best-effort: the DOM path below works
+    // without it, just less precisely.
+    let rpc = rpc_read && match net::ensure_recorder(engine) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("flowy: reading results from the DOM ({error:#})");
+            false
+        }
+    };
     ui::wait_for_ready(engine, Duration::from_secs(45))?;
 
     capture_listener(engine)?;
@@ -159,48 +196,47 @@ pub fn generate(prompt: &str, timeout: Duration, retries: usize) -> Result<()> {
     let before = state(engine)?;
     if before.button.is_none() {
         bail!(
-            "no prompt box on this page ({}). Open a Flow project first: `flowy open`",
+            "no prompt box on {} — Flow has no project open there. Run `flowy open` to pick one; \
+             if the project you expect is missing, it belongs to a different account than the \
+             Safari profile flowy drives (`flowy profile`)",
             before.path
         );
     }
 
-    let typed = type_prompt(engine, prompt)?;
-    if typed.prompt.as_deref().map(str::trim) != Some(prompt.trim()) {
-        bail!(
-            "the prompt box did not take the text (it holds {:?})",
-            typed.prompt.unwrap_or_default()
-        );
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let state = state(engine)?;
-        if state.button.as_ref().is_some_and(|button| !button.disabled) {
-            break;
-        }
-        if Instant::now() >= deadline {
-            bail!("the generate button stayed disabled after the prompt was typed");
-        }
-        thread::sleep(POLL);
-    }
+    arm(engine, prompt)?;
 
     let mut baseline = before;
     let mut last_failure = String::new();
+    // The recorder's sequence number *before* the request goes out. Everything after it belongs
+    // to this attempt.
+    let mut mark = if rpc { net::mark(engine).unwrap_or(0) } else { 0 };
     for attempt in 0..=retries {
         if attempt == 0 {
-            let fired = eval_patched(engine, FIRE)?;
-            if fired.get("fired").and_then(Value::as_bool) != Some(true) {
-                bail!(
-                    "could not trigger generation: {}",
-                    fired
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown reason")
-                );
+            let (first_mark, took) = trigger(engine, prompt, rpc)?;
+            mark = first_mark.unwrap_or(mark);
+            if !took {
+                // The captured binding belongs to a component that has since been destroyed, so
+                // calling it does nothing at all — and the run would then wait out the whole
+                // timeout for images that were never requested. Rebuild the box and try again.
+                eprintln!("flowy: the trigger did not submit; rebuilding the prompt box");
+                eval_patched(engine, FORGET)?;
+                capture_listener(engine)?;
+                arm(engine, prompt)?;
+                baseline = state(engine)?;
+                let (rebuilt_mark, took) = trigger(engine, prompt, rpc)?;
+                mark = rebuilt_mark.unwrap_or(mark);
+                if !took {
+                    bail!(
+                        "the generate button accepted nothing, even after the prompt box was rebuilt"
+                    );
+                }
             }
             println!("Generating: {prompt}");
         } else {
             let pending = state(engine)?.failures.saturating_sub(baseline.failures);
+            if rpc {
+                mark = net::mark(engine).unwrap_or(mark);
+            }
             let retried = eval_patched(engine, &retry_script(pending.max(1)))?;
             let clicked = retried.get("clicked").and_then(Value::as_u64).unwrap_or(0);
             if clicked == 0 {
@@ -211,11 +247,16 @@ pub fn generate(prompt: &str, timeout: Duration, retries: usize) -> Result<()> {
             baseline = state(engine)?;
         }
 
-        match wait_for_outcome(engine, &baseline, timeout) {
-            Outcome::Images(images) => {
+        match wait_for_outcome(engine, &baseline, timeout, rpc.then_some(mark)) {
+            Outcome::Images(images, source) => {
                 for (index, url) in images.iter().enumerate() {
                     println!("{}. {url}", index + 1);
                 }
+                let via = match source {
+                    Source::Rpc => "the generation RPC",
+                    Source::Dom => "the DOM",
+                };
+                eprintln!("flowy: {} image(s) via {via}", images.len());
                 return Ok(());
             }
             Outcome::Failed(message) => {
@@ -234,6 +275,85 @@ pub fn generate(prompt: &str, timeout: Duration, retries: usize) -> Result<()> {
         }
     }
     bail!("generation failed after {retries} retries: {last_failure}")
+}
+
+/// Drop the captured binding, so [`capture_listener`] rebuilds the prompt box instead of
+/// reporting the dead one it still holds.
+const FORGET: &str = "(()=>{window.__flowyGenerate=null;return true;})()";
+
+/// Fire the captured binding and report whether the page actually submitted.
+///
+/// Returns the recorder mark taken *before* the click, so the caller can look for that request's
+/// reply, and whether the submit took.
+fn trigger(
+    engine: &safari_driver::SafariEngine,
+    prompt: &str,
+    rpc: bool,
+) -> Result<(Option<u64>, bool)> {
+    let mark = rpc.then(|| net::mark(engine).unwrap_or(0));
+    let fired = eval_patched(engine, FIRE)?;
+    if fired.get("fired").and_then(Value::as_bool) != Some(true) {
+        bail!(
+            "could not trigger generation: {}",
+            fired
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown reason")
+        );
+    }
+    Ok((mark, trigger_took(engine, prompt, mark)))
+}
+
+/// Did the submit go through? A live one either reaches the recorder or clears the prompt box,
+/// and Flow disables the button while a request is in flight. A dead binding does none of these.
+fn trigger_took(
+    engine: &safari_driver::SafariEngine,
+    prompt: &str,
+    mark: Option<u64>,
+) -> bool {
+    let deadline = Instant::now() + TRIGGER_WAIT;
+    loop {
+        if let Some(mark) = mark
+            && net::saw_request(engine, mark).unwrap_or(false)
+        {
+            return true;
+        }
+        if let Ok(state) = state(engine)
+            && state.button.is_some()
+        {
+            let cleared = state.prompt.as_deref().map(str::trim) != Some(prompt.trim());
+            let busy = state.button.as_ref().is_some_and(|button| button.disabled);
+            if cleared || busy {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// Put `prompt` in the box and wait until the button accepts it.
+fn arm(engine: &safari_driver::SafariEngine, prompt: &str) -> Result<()> {
+    let typed = type_prompt(engine, prompt)?;
+    if typed.prompt.as_deref().map(str::trim) != Some(prompt.trim()) {
+        bail!(
+            "the prompt box did not take the text (it holds {:?})",
+            typed.prompt.unwrap_or_default()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = state(engine)?;
+        if state.button.as_ref().is_some_and(|button| !button.disabled) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the generate button stayed disabled after the prompt was typed");
+        }
+        thread::sleep(POLL);
+    }
 }
 
 /// Type into the prompt box without submitting.
@@ -436,14 +556,29 @@ fn open_project_script(path: &str) -> String {
 fn wait_for_path(engine: &safari_driver::SafariEngine, path: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if state(engine)?.path == path {
+        let current = state(engine)?.path;
+        if current == path {
             return Ok(());
         }
+        // Flow answers a project id that does not belong to the signed-in account with a
+        // redirect to /404, not with an error. The page then renders as an empty shell, which
+        // looks like "the app never booted" unless the redirect is named.
+        if is_missing_project(&current) {
+            bail!(
+                "{path} is not in the account flowy is driving: Flow redirected to /404. \
+                 Check `flowy profile` — the project has to exist in that Safari profile's account"
+            );
+        }
         if Instant::now() >= deadline {
-            bail!("the Flow tab never reached {path}");
+            bail!("the Flow tab never reached {path} (it is on {current})");
         }
         thread::sleep(POLL);
     }
+}
+
+/// Flow's "this project is not in your account" redirect.
+fn is_missing_project(path: &str) -> bool {
+    path == "/404" || path.starts_with("/404/")
 }
 
 fn project_id(path: &str) -> Option<&str> {
@@ -461,57 +596,92 @@ fn first_project_link(engine: &safari_driver::SafariEngine) -> Result<String> {
     )?;
     match value.as_str() {
         Some(href) if href.starts_with("/project/") => Ok(href.to_owned()),
-        _ => bail!("there is no project on the Flow home screen to generate in"),
+        _ => bail!(
+            "there is no project on the Flow home screen to generate in. Create one in the \
+             account the Safari profile flowy drives (`flowy profile`)"
+        ),
     }
 }
 
-/// Wait for the request to end. Images win over a failure notice, because Flow can answer a
-/// two-image request with one picture and one failure; the pictures are still worth having.
+/// Wait for the request to end.
+///
+/// With a recorder in place the generation RPC answers first: its stream closes only when the
+/// request is over, so the reply needs no debounce and does not depend on the card being
+/// rendered. The DOM is consulted when the recorder is absent, when it never saw the request,
+/// or when the reply is late — and a DOM reading still wins over an RPC failure, because Flow
+/// can answer a two-image request with one picture and one failure notice, and the picture is
+/// worth having.
 fn wait_for_outcome(
     engine: &safari_driver::SafariEngine,
     before: &State,
     timeout: Duration,
+    rpc_mark: Option<u64>,
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     // New means "not on the page when the request was sent". Comparing sets rather than counts
     // keeps this correct when the project list virtualises and drops older cards.
     let seen: HashSet<&str> = before.images.iter().map(String::as_str).collect();
     let mut last = 0usize;
     let mut settled: Option<(Instant, Vec<String>)> = None;
+    let mut dom = rpc_mark.is_none();
     loop {
-        let state = match state(engine) {
-            Ok(state) => state,
-            Err(_) => {
-                thread::sleep(POLL);
-                continue;
-            }
-        };
-        let new: Vec<String> = state
-            .images
-            .into_iter()
-            .filter(|url| !seen.contains(url.as_str()))
-            .collect();
-        if new.len() > last {
-            last = new.len();
-            settled = Some((Instant::now(), new));
-        } else if let Some((seen_at, images)) = &settled
-            && seen_at.elapsed() >= SETTLE
-        {
-            return Outcome::Images(images.clone());
-        }
-        // A retried card clears its notice, so only a notice that outlives the baseline counts.
-        if settled.is_none() && state.failures > before.failures {
-            return Outcome::Failed(
-                state
-                    .failure
-                    .unwrap_or_else(|| "the request failed".to_owned()),
-            );
-        }
+        // Checked first: an evaluation can fail for as long as the document is being replaced,
+        // and that must not become an unbounded wait.
         if Instant::now() >= deadline {
             return match settled {
-                Some((_, images)) => Outcome::Images(images),
+                Some((_, images)) => Outcome::Images(images, Source::Dom),
                 None => Outcome::Timeout,
             };
+        }
+
+        if let Some(mark) = rpc_mark {
+            match net::reply_since(engine, mark) {
+                Ok(Some(Reply::Images(images))) => return Outcome::Images(images, Source::Rpc),
+                Ok(Some(Reply::Failed(message))) => {
+                    // A DOM reading outranks this: the reply describes the RPC, not the cards.
+                    if settled.is_none() {
+                        return Outcome::Failed(message);
+                    }
+                }
+                _ => {}
+            }
+            if !dom {
+                let waited = started.elapsed();
+                let unwatched = waited >= RPC_PROBE
+                    && !net::saw_request(engine, mark).unwrap_or(true);
+                if unwatched || waited >= RPC_WAIT {
+                    dom = true;
+                }
+            }
+        }
+
+        if dom {
+            let Ok(state) = state(engine) else {
+                thread::sleep(POLL);
+                continue;
+            };
+            let new: Vec<String> = state
+                .images
+                .into_iter()
+                .filter(|url| !seen.contains(url.as_str()))
+                .collect();
+            if new.len() > last {
+                last = new.len();
+                settled = Some((Instant::now(), new));
+            } else if let Some((seen_at, images)) = &settled
+                && seen_at.elapsed() >= SETTLE
+            {
+                return Outcome::Images(images.clone(), Source::Dom);
+            }
+            // A retried card clears its notice, so only a notice that outlives the baseline counts.
+            if settled.is_none() && state.failures > before.failures {
+                return Outcome::Failed(
+                    state
+                        .failure
+                        .unwrap_or_else(|| "the request failed".to_owned()),
+                );
+            }
         }
         thread::sleep(POLL);
     }
@@ -549,6 +719,14 @@ fn type_prompt(engine: &safari_driver::SafariEngine, text: &str) -> Result<State
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_the_missing_project_redirect() {
+        assert!(is_missing_project("/404"));
+        assert!(is_missing_project("/404/"));
+        assert!(!is_missing_project("/4040"));
+        assert!(!is_missing_project("/project/6f2c"));
+    }
 
     #[test]
     fn reads_the_project_id_from_a_project_path() {

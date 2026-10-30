@@ -17,8 +17,11 @@ cookies, no browser session.
 ## Requirements
 
 - macOS with Safari, and the safari-driver extension bridge enabled in the Safari profile that is
-  signed in to Google.
+  signed in to Google. Enable it in **one** profile only: the bridge is a single port, so several
+  profiles means several workers racing for it.
 - A Flow project already created in that profile (Flow's UI, once).
+- That profile pinned with `flowy profile "<name>"`. Without a pin the extension resolves a
+  profile itself and a run can quietly drive the wrong account.
 
 ## Commands
 
@@ -32,10 +35,13 @@ cookies, no browser session.
 | `flowy prompt "<text>"` | Type into the prompt box without submitting |
 | `flowy fire` | Submit whatever the prompt box holds |
 | `flowy reload` / `flowy focus` | Reload the tab / bring it to the front |
+| `flowy profile [name]` | Show or pin the Safari profile flowy drives |
+| `flowy tabs` | List the tabs the extension can see, and which one flowy uses |
 | `flowy eval "<script>"` / `flowy eval-file <path>` | Run a page script and print the JSON result |
 | `flowy net-install` / `flowy net-dump [filter]` | Record the app's own requests, for reverse-engineering |
 
-`generate` takes `--timeout` (per attempt, default 240s) and `--retries` (default 2).
+`generate` takes `--timeout` (per attempt, default 240s), `--retries` (default 2), and `--no-rpc`
+(read the DOM only). It says which path answered: `via the generation RPC` or `via the DOM`.
 
 ## Why the trigger is not a click
 
@@ -98,6 +104,33 @@ The full write-up of the five layers — the trusted-event gate, the scored toke
 scoring, the request coupling, and why the app's internals are unreachable — is in
 [docs/anti-automation.md](docs/anti-automation.md).
 
+## Where the images come from
+
+The trigger goes through the UI, but the *results* are read from the generation RPC's reply.
+`ogiZ0b` answers on the streaming protocol, and its stream closes only when the request is over,
+so the reply is a definitive completion signal — no settle window, no guessing whether a card has
+finished painting.
+
+To see it, `generate` installs a recorder at document start (the app keeps its own `fetch`
+reference from module load, so a patch added later is invisible to it) and takes the reply whose
+sequence number is newer than the mark recorded just before the click. The reply carries each
+image URL twice with different signatures, so images are deduplicated by id.
+
+The DOM stays as the fallback: when the recorder is absent, when it never saw the request, or
+when the reply is late. `--no-rpc` forces that path. Measured on the same project:
+
+| Path | Wall clock |
+| --- | --- |
+| generation RPC | 25–27 s |
+| DOM (settle window) | 29 s |
+
+The saving is the 2 s debounce and the DOM serialisation, not the generation itself.
+
+A trigger that does not submit is now caught instead of waited out: a live submit clears the
+prompt box and sends the request, so when neither happens within 6 s the binding belonged to a
+destroyed component — `generate` rebuilds the prompt box and fires once more, then fails with a
+message rather than sitting out the timeout.
+
 ## Why a run retries
 
 Flow's image service fails requests often enough to matter — "Sorry, this image failed to
@@ -118,5 +151,6 @@ runs longer than its budget.
 - `src/page.rs` — the Safari bridge, the pinned engine, and the one owned Flow tab
 - `src/ui.rs` — the background-render patch, the page probe, and `status`
 - `src/generate.rs` — the prompt, the captured trigger, the retry loop, and downloads
-- `src/browser.rs`, `src/state.rs` — the stable extension session id in `~/.flowy`
+- `src/net.rs` — the request recorder, and the reader for the generation RPC's reply
+- `src/browser.rs`, `src/state.rs` — the pinned Safari session id and profile in `~/.flowy`
 - `docs/anti-automation.md` — the security research behind the design

@@ -30,6 +30,10 @@ enum Command {
     Status,
     /// Bring the Flow tab to the front
     Focus,
+    /// List the Safari tabs the extension can see, and which one flowy drives
+    Tabs,
+    /// Show the Safari profile flowy drives, or pin a different one
+    Profile { name: Option<String> },
     /// Generate images for a prompt in the current project and print their URLs
     Generate {
         prompt: String,
@@ -39,6 +43,9 @@ enum Command {
         /// How many times to retry a failed request
         #[arg(long, default_value_t = 2)]
         retries: usize,
+        /// Read the results from the DOM only, skipping the generation RPC's reply
+        #[arg(long)]
+        no_rpc: bool,
     },
     /// Type a prompt without submitting it
     Prompt { text: String },
@@ -65,16 +72,34 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
+    // safari-driver reads SAFARI_PROFILE on every command, so the pinned profile has to be in
+    // the environment before anything touches the bridge. Without this a run silently drives
+    // whichever profile the extension resolves — often the personal one.
+    browser::export_profile();
     let result = match cli.command {
         Command::Open => ui::open_flow(),
         Command::Reload => ui::reload_flow(),
         Command::Status => ui::status(),
         Command::Focus => ui::focus_tab(),
+        Command::Tabs => page::tabs(),
+        Command::Profile { name } => match name.as_deref() {
+            Some(name) => browser::BrowserState::pin_profile(Some(name)).map(|pinned| {
+                println!("profile: {}", pinned.unwrap_or_default());
+            }),
+            None => {
+                match browser::BrowserState::load().profile {
+                    Some(profile) => println!("profile: {profile}"),
+                    None => println!("profile: (not pinned — the extension chooses)"),
+                }
+                Ok(())
+            }
+        },
         Command::Generate {
             prompt,
             timeout,
             retries,
-        } => generate::generate(&prompt, Duration::from_secs(timeout), retries),
+            no_rpc,
+        } => generate::generate(&prompt, Duration::from_secs(timeout), retries, !no_rpc),
         Command::Prompt { text } => generate::prompt(&text),
         Command::Fire => generate::fire(),
         Command::Images => generate::images(),

@@ -91,21 +91,34 @@ pub fn ensure_tab(engine: &SafariEngine) -> Result<()> {
 /// hand is refused by the extension and a new tab is opened instead.
 fn adopt_tab(engine: &SafariEngine) -> bool {
     if engine.backend_name() != "safari-extension" {
+        eprintln!("flowy: no tab to adopt (backend is {})", engine.backend_name());
         return false;
     }
-    let Ok(tabs) = engine.execute("safari_list_tabs", &json!({})) else {
-        return false;
+    let tabs = match engine.execute("safari_list_tabs", &json!({})) {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            eprintln!("flowy: no tab to adopt (listing tabs failed: {error})");
+            return false;
+        }
     };
     let Some(tab_index) = flow_tab_index(&tabs) else {
+        eprintln!("flowy: no tab to adopt (no flow.google.com tab is open)");
         return false;
     };
-    engine
-        .execute(
-            "safari_switch_tab",
-            &json!({"tabIndex": tab_index, "allow_user_tab": true}),
-        )
-        .is_ok()
-        && engine.current_receipt().is_some()
+    match engine.execute(
+        "safari_switch_tab",
+        &json!({"tabIndex": tab_index, "allow_user_tab": true}),
+    ) {
+        Ok(_) if engine.current_receipt().is_some() => true,
+        Ok(_) => {
+            eprintln!("flowy: no tab to adopt (switched to tab {tab_index} but got no receipt)");
+            false
+        }
+        Err(error) => {
+            eprintln!("flowy: no tab to adopt (switching to tab {tab_index} failed: {error})");
+            false
+        }
+    }
 }
 
 /// Find the 1-based index of a Flow tab. The engine maps the extension's index into
@@ -320,4 +333,42 @@ mod tests {
         assert!(!is_flow_url("about:blank"));
         assert!(!is_flow_url(""));
     }
+}
+
+/// Print the tabs the extension can see, and mark the one commands would drive.
+///
+/// Worth having as a command: when two Flow tabs exist, every run silently adopts the first one,
+/// and the symptom is a page that answers probes but never matches what you are looking at.
+pub fn tabs() -> Result<()> {
+    ensure_bridge()?;
+    let engine = engine();
+    let list = engine
+        .execute("safari_list_tabs", &json!({}))
+        .map_err(|error| anyhow::anyhow!("could not list Safari tabs: {error}"))?;
+    let chosen = flow_tab_index(&list);
+    for tab in list.as_array().cloned().unwrap_or_default() {
+        let index = tab
+            .get("index")
+            .and_then(Value::as_i64)
+            .or_else(|| tab.get("window_id").and_then(Value::as_str)?.parse().ok());
+        let url = tab
+            .get("url")
+            .or_else(|| tab.get("safeUrl"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mark = if index == chosen { "  <- flowy uses this" } else { "" };
+        println!("[{}] {url}{mark}", index.unwrap_or_default());
+    }
+    println!("{} tab(s), receipt: {}", list.as_array().map_or(0, Vec::len),
+        if engine.current_receipt().is_some() { "owned" } else { "none" });
+    if let Some(tab) = list
+        .as_array()
+        .and_then(|tabs| tabs.iter().find(|tab| {
+            tab.get("index").and_then(Value::as_i64) == chosen
+                || tab.get("window_id").and_then(Value::as_str) == chosen.map(|i| i.to_string()).as_deref()
+        }))
+    {
+        println!("raw: {}", serde_json::to_string(tab)?);
+    }
+    Ok(())
 }

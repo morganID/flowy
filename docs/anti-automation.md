@@ -165,6 +165,17 @@ The half that *is* worth building is the reverse split: **UI for the trigger, RP
 Generation needs the trusted event and the scored token; polling for results does not. The read
 RPCs (`NfrxTb`, `ve2Lsc`) are ordinary authenticated `batchexecute` calls with no reCAPTCHA in the
 payload, so a run could fire through the UI and then fetch finished images over RPC instead of
-scraping `src` attributes from the DOM. That removes the settle-window guessing in
-`wait_for_outcome` without touching the guarded path.
+scraping `src` attributes from the DOM.
+
+That is now how `flowy generate` works, and the reply it uses is the generation RPC itself rather
+than a separate read: `ogiZ0b` streams its result, and the stream closes only when the request is
+over, so the reply *is* the completion signal. Measured on one project, both paths end to end:
+
+| Path | Wall clock |
+| --- | --- |
+| generation RPC reply | 25–27 s |
+| DOM with its settle window | 29 s |
+
+The difference is the 2 s debounce and the DOM serialisation. The reply also does not care whether
+the card has painted, which matters when the tab is in the background or the list virtualises.
 
