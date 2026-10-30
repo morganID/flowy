@@ -29,6 +29,12 @@ const INSTALL: &str = r#"(()=>{
     try{
       const url=(typeof input==='string')?input:(input&&input.url)||'';
       if(init&&typeof init.body==='string')push('fetch',url,init.body);
+      else if(init&&init.body&&(init.body instanceof Uint8Array||init.body instanceof ArrayBuffer||ArrayBuffer.isView(init.body))){
+        const body=init.body;
+        const bytes=body instanceof ArrayBuffer?new Uint8Array(body)
+          :new Uint8Array(body.buffer,body.byteOffset,body.byteLength);
+        push('fetch-bin',url,new TextDecoder('utf-8').decode(bytes).slice(0,4000));
+      }
       else if(input&&input.clone)input.clone().text().then(text=>push('fetch',url,text)).catch(error=>push('fetch-locked',url,String(error)));
       else push('fetch',url,'');
     }catch(error){}

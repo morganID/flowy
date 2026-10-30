@@ -73,19 +73,25 @@ payload is small: model key, aspect ratio, seed, count, and the prompt.
 ```
 
 That token is minted by reCAPTCHA Enterprise — the page calls
-`www.google.com/recaptcha/enterprise/clr` at the moment generation is triggered. Replaying a
-captured body verbatim returns HTTP 200 and then:
+`www.google.com/recaptcha/enterprise/clr` at the moment generation is triggered. Every attempt
+to send the call from outside the app comes back HTTP 200 with an RPC-level refusal:
 
 ```
 [["wrb.fr","ogiZ0b",null,null,null,[7,null,[["type.googleapis.com/google.rpc.ErrorInfo",
   ["PUBLIC_ERROR_UNUSUAL_ACTIVITY"]]]],"generic"]]
 ```
 
-So the request is bound to the token that was issued for it. A direct path would have to mint
-its own token through `grecaptcha.enterprise.execute`, which is both unproven and exactly the
-behaviour Google's abuse detection looks for — a bad trade for the account that owns the Flow
-project. `flowy` therefore drives the app's own submit path, and `net-install` / `net-dump`
-stay as diagnostics for anyone who wants to revisit that decision.
+Three variants were tried: the captured body verbatim, the same body with a token minted fresh
+through `grecaptcha.enterprise.execute`, and that body with a new prompt and seed. All three
+were refused, and the third test changed nothing but the token — so the refusal is not about
+token freshness or the prompt. It is about the shape of the request the app builds: a streamed
+`Request` on the `rt=c` protocol, preceded by the `ngNC2` call, with client state that a
+standalone POST does not reproduce.
+
+Reconstructing that pipeline is a much larger job than the UI path it would replace, and every
+rejected attempt is itself an "unusual activity" signal against the account that owns the
+project. `flowy` therefore drives the app's own submit path; `net-install` / `net-dump` stay as
+diagnostics for anyone who wants to pick the thread up later.
 
 ## Why a run retries
 
