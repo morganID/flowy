@@ -68,11 +68,12 @@ Flow's front end does the generation with a `batchexecute` POST to `rpcids=ogiZ0
 payload is small: model key, aspect ratio, seed, count, and the prompt.
 
 ```
-[null,[[null,null,null,<seed>,3,"BELUGA",null,[null,22,null,null,null,"<project>",null,null,
-  null,null,["<2048-character token>"]]]]]
+[null,[[null,null,null,<seed>,3,"BELUGA",null,
+  [null,22,null,null,null,"<project>",null,null,null,null,["<2510-char token>",1]],
+  [[["<prompt>"]]],null,null,null,"<uuid>","<uuid>"]]]
 ```
 
-That token is minted by reCAPTCHA Enterprise — the page calls
+That token is minted by reCAPTCHA Enterprise — the page POSTs a protobuf to
 `www.google.com/recaptcha/enterprise/clr` at the moment generation is triggered. Every attempt
 to send the call from outside the app comes back HTTP 200 with an RPC-level refusal:
 
@@ -82,8 +83,8 @@ to send the call from outside the app comes back HTTP 200 with an RPC-level refu
 ```
 
 Three variants were tried: the captured body verbatim, the same body with a token minted fresh
-through `grecaptcha.enterprise.execute`, and that body with a new prompt and seed. All three
-were refused, and the third test changed nothing but the token — so the refusal is not about
+through `grecaptcha.enterprise.execute` plus a new prompt and seed, and — the decisive one — a
+fresh token with **nothing else changed**. All three were refused. So the refusal is not about
 token freshness or the prompt. It is about the shape of the request the app builds: a streamed
 `Request` on the `rt=c` protocol, preceded by the `ngNC2` call, with client state that a
 standalone POST does not reproduce.
@@ -92,6 +93,10 @@ Reconstructing that pipeline is a much larger job than the UI path it would repl
 rejected attempt is itself an "unusual activity" signal against the account that owns the
 project. `flowy` therefore drives the app's own submit path; `net-install` / `net-dump` stay as
 diagnostics for anyone who wants to pick the thread up later.
+
+The full write-up of the five layers — the trusted-event gate, the scored token, the risk
+scoring, the request coupling, and why the app's internals are unreachable — is in
+[docs/anti-automation.md](docs/anti-automation.md).
 
 ## Why a run retries
 
@@ -114,3 +119,4 @@ runs longer than its budget.
 - `src/ui.rs` — the background-render patch, the page probe, and `status`
 - `src/generate.rs` — the prompt, the captured trigger, the retry loop, and downloads
 - `src/browser.rs`, `src/state.rs` — the stable extension session id in `~/.flowy`
+- `docs/anti-automation.md` — the security research behind the design
