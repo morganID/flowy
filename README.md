@@ -33,6 +33,7 @@ cookies, no browser session.
 | `flowy fire` | Submit whatever the prompt box holds |
 | `flowy reload` / `flowy focus` | Reload the tab / bring it to the front |
 | `flowy eval "<script>"` / `flowy eval-file <path>` | Run a page script and print the JSON result |
+| `flowy net-install` / `flowy net-dump [filter]` | Record the app's own requests, for reverse-engineering |
 
 `generate` takes `--timeout` (per attempt, default 240s) and `--retries` (default 2).
 
@@ -60,6 +61,31 @@ the component, and keeps the listener on `window` for the rest of the page's lif
 
 An in-app route change is used deliberately: a real navigation would replace the document and
 lose the hook.
+
+## What the direct RPC would need
+
+Flow's front end does the generation with a `batchexecute` POST to `rpcids=ogiZ0b`, and the
+payload is small: model key, aspect ratio, seed, count, and the prompt.
+
+```
+[null,[[null,null,null,<seed>,3,"BELUGA",null,[null,22,null,null,null,"<project>",null,null,
+  null,null,["<2048-character token>"]]]]]
+```
+
+That token is minted by reCAPTCHA Enterprise — the page calls
+`www.google.com/recaptcha/enterprise/clr` at the moment generation is triggered. Replaying a
+captured body verbatim returns HTTP 200 and then:
+
+```
+[["wrb.fr","ogiZ0b",null,null,null,[7,null,[["type.googleapis.com/google.rpc.ErrorInfo",
+  ["PUBLIC_ERROR_UNUSUAL_ACTIVITY"]]]],"generic"]]
+```
+
+So the request is bound to the token that was issued for it. A direct path would have to mint
+its own token through `grecaptcha.enterprise.execute`, which is both unproven and exactly the
+behaviour Google's abuse detection looks for — a bad trade for the account that owns the Flow
+project. `flowy` therefore drives the app's own submit path, and `net-install` / `net-dump`
+stay as diagnostics for anyone who wants to revisit that decision.
 
 ## Why a run retries
 

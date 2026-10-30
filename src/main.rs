@@ -1,6 +1,7 @@
 //! Google Flow CLI, driven through the UI in Safari.
 mod browser;
 mod generate;
+mod net;
 mod page;
 mod state;
 mod ui;
@@ -52,6 +53,10 @@ enum Command {
         #[arg(long, default_value = "out")]
         out: PathBuf,
     },
+    /// Install the request recorder right after a navigation (direct-RPC work)
+    NetInstall,
+    /// Print the recorded requests, optionally filtered by URL fragment
+    NetDump { filter: Option<String> },
     /// Evaluate a JavaScript expression in the Flow tab and print the JSON result
     Eval { script: String },
     /// Same as `eval`, but read the script from a file (keeps quoting sane for long scripts)
@@ -74,6 +79,8 @@ fn main() {
         Command::Fire => generate::fire(),
         Command::Images => generate::images(),
         Command::Download { index, out } => generate::download(index, &out),
+        Command::NetInstall => net::install(),
+        Command::NetDump { filter } => net::dump(filter.as_deref()),
         Command::Eval { script } => ui::eval_script(&script),
         Command::EvalFile { path } => ui::eval_file(&path),
     };

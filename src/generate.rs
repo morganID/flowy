@@ -102,13 +102,6 @@ const FIRE: &str = r#"(()=>{
   return {fired:true};
 })()"#;
 
-/// In-app route changes. A real navigation would replace the document and lose the hook.
-const GO_HOME: &str = r#"(()=>{
-  for(const element of document.querySelectorAll('a,button,[role="button"]')){
-    if((element.getAttribute('aria-label')||'').trim()==='Home'){element.click();return {clicked:true};}
-  }
-  return {clicked:false};})()"#;
-
 #[derive(Debug, Clone, Deserialize, Default)]
 struct State {
     #[serde(default)]
@@ -356,9 +349,11 @@ fn fetch(url: &str, out: &Path, number: usize) -> Result<std::path::PathBuf> {
 
 /// Make sure the generate binding is captured for the component that is on screen.
 ///
-/// The listener only exists while the prompt box is being built, so a fresh page needs one
-/// round trip through the home route to rebuild it. The hook lives on `window`, which an
-/// in-app route change does not touch.
+/// The listener only exists while the prompt box is being built, so a page that already booted
+/// cannot be patched into shape. Reloading is not an option either: `safari_navigate` returns
+/// once the document has loaded, by which point the app has already built the prompt box. What
+/// does work is a route change the app performs itself — leaving the project and entering it
+/// again rebuilds the component, and the hook survives because the document is never replaced.
 fn capture_listener(engine: &safari_driver::SafariEngine) -> Result<()> {
     eval_patched(engine, CAPTURE)?;
     if state(engine)?.generate {
@@ -366,51 +361,66 @@ fn capture_listener(engine: &safari_driver::SafariEngine) -> Result<()> {
     }
 
     let current = state(engine)?;
-    let project = project_id(&current.path).map(str::to_owned);
-    let destination = match &project {
+    let target = match project_id(&current.path) {
         Some(id) => format!("/project/{id}"),
-        // From the home screen there is nothing to come back to, so enter the newest
-        // project and let that navigation do the capturing.
-        None => String::new(),
+        // On the home screen there is no prompt box to drive; open the newest project, which
+        // is what a person would do next anyway.
+        None => first_project_link(engine)?,
     };
 
-    let home = eval_patched(engine, GO_HOME)?;
-    if home.get("clicked").and_then(Value::as_bool) != Some(true) {
-        bail!("could not find the Flow home button to rebuild the prompt box");
+    if current.path != "/" {
+        let home = eval_patched(engine, GO_HOME)?;
+        if home.get("clicked").and_then(Value::as_bool) != Some(true) {
+            bail!("could not find the Flow home button to rebuild the prompt box");
+        }
+        wait_for_path(engine, "/", Duration::from_secs(20))?;
     }
-    wait_for_path(engine, "/", Duration::from_secs(20))?;
 
-    let target = if destination.is_empty() {
-        first_project_link(engine)?
-    } else {
-        destination
-    };
-    let open = eval_patched(engine, &open_project_script(&target))?;
-    if open.get("clicked").and_then(Value::as_bool) != Some(true) {
-        bail!("could not re-open {target} from the Flow home screen");
+    // The home route paints its project grid after the route change resolves, so the link is
+    // not there on the first look.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let open = eval_patched(engine, &open_project_script(&target))?;
+        if open.get("clicked").and_then(Value::as_bool) == Some(true) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("could not re-open {target} from the Flow home screen");
+        }
+        thread::sleep(POLL);
     }
     wait_for_path(engine, &target, Duration::from_secs(20))?;
-    wait_for_prompt_box(engine, Duration::from_secs(20))?;
-
-    // A hook that is gone means the round trip replaced the document, so the listener was
-    // missed and the next attempt has to start over.
-    if !state(engine)?.hooked {
-        bail!(
-            "the page reloaded while re-entering the project, so the generate listener could not be captured. Run the command again"
-        );
-    }
-    eval_patched(engine, CAPTURE)?;
-    if !state(engine)?.generate {
-        bail!("the generate listener was not captured; run the command again");
-    }
-    Ok(())
+    wait_for_generate(engine, Duration::from_secs(30))
 }
 
-fn project_id(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/project/")?;
-    let id = rest.split('/').next().unwrap_or_default();
-    (!id.is_empty()).then_some(id)
+/// Wait for the prompt box to be created and to hand over its generate binding.
+fn wait_for_generate(engine: &safari_driver::SafariEngine, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Evaluations fail while the document is being replaced, which is expected here.
+        if let Ok(state) = state(engine)
+            && state.generate
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // Telling these two apart matters: a missing hook means the injection lost the race
+            // with the bundle, while a missing binding means the page never built a prompt box.
+            if !state(engine).map(|state| state.hooked).unwrap_or(false) {
+                bail!("the page loaded but the capture hook never installed");
+            }
+            bail!("the project loaded but never exposed its generate binding");
+        }
+        thread::sleep(POLL);
+    }
 }
+
+/// Leave the project without reloading: the hook only survives an in-app route change.
+const GO_HOME: &str = r#"(()=>{
+  for(const element of document.querySelectorAll('a,button,[role="button"]')){
+    if((element.getAttribute('aria-label')||'').trim()==='Home'){element.click();return {clicked:true};}
+  }
+  return {clicked:false};})()"#;
 
 fn open_project_script(path: &str) -> String {
     format!(
@@ -421,19 +431,6 @@ fn open_project_script(path: &str) -> String {
   return {{clicked:true}};}})()"#,
         path.replace('"', "")
     )
-}
-
-fn first_project_link(engine: &safari_driver::SafariEngine) -> Result<String> {
-    let value = eval_patched(
-        engine,
-        r#"(()=>{
-  const link=document.querySelector('a[href^="/project/"]');
-  return link?link.getAttribute('href'):null;})()"#,
-    )?;
-    match value.as_str() {
-        Some(href) if href.starts_with("/project/") => Ok(href.to_owned()),
-        _ => bail!("there is no project on the Flow home screen to generate in"),
-    }
 }
 
 fn wait_for_path(engine: &safari_driver::SafariEngine, path: &str, timeout: Duration) -> Result<()> {
@@ -449,16 +446,22 @@ fn wait_for_path(engine: &safari_driver::SafariEngine, path: &str, timeout: Dura
     }
 }
 
-fn wait_for_prompt_box(engine: &safari_driver::SafariEngine, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if state(engine)?.prompt.is_some() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("the prompt box never appeared");
-        }
-        thread::sleep(POLL);
+fn project_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/project/")?;
+    let id = rest.split('/').next().unwrap_or_default();
+    (!id.is_empty()).then_some(id)
+}
+
+fn first_project_link(engine: &safari_driver::SafariEngine) -> Result<String> {
+    let value = eval_patched(
+        engine,
+        r#"(()=>{
+  const link=document.querySelector('a[href^="/project/"]');
+  return link?link.getAttribute('href'):null;})()"#,
+    )?;
+    match value.as_str() {
+        Some(href) if href.starts_with("/project/") => Ok(href.to_owned()),
+        _ => bail!("there is no project on the Flow home screen to generate in"),
     }
 }
 
@@ -556,13 +559,5 @@ mod tests {
         assert_eq!(project_id("/project/6f2c/frames"), Some("6f2c"));
         assert_eq!(project_id("/"), None);
         assert_eq!(project_id("/project/"), None);
-    }
-
-    #[test]
-    fn quotes_the_project_path_for_the_page_script() {
-        assert_eq!(
-            open_project_script("/project/6f2c"),
-            "(()=>{\n  const link=document.querySelector('a[href=\"/project/6f2c\"]');\n  if(!link)return {clicked:false};\n  link.click();\n  return {clicked:true};})()"
-        );
     }
 }

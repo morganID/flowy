@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod generate;
+pub mod net;
 pub mod page;
 pub mod state;
 pub mod ui;
